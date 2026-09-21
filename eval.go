@@ -74,8 +74,10 @@ func (w *escapeeWriter) Write(b []byte) (int, error) {
 type Runtime struct {
 	*escapeeWriter
 	*scope
+	rootScope    *scope
 	content      func(*Runtime, Expression)
 	includeDepth int
+	probe        *probe
 
 	context reflect.Value
 }
@@ -110,7 +112,7 @@ func (s scope) sortedBlocks() []string {
 
 // YieldBlock yields a block in the current context, will panic if the context is not available
 func (st *Runtime) YieldBlock(name string, context interface{}) {
-	block, found := st.getBlock(name)
+	block, found := st.getBlockProbed(name, st)
 
 	if !found {
 		panic(fmt.Errorf("Block %q was not found!!", name))
@@ -127,23 +129,80 @@ func (st *Runtime) YieldBlock(name string, context interface{}) {
 }
 
 func (st *scope) getBlock(name string) (block *BlockNode, found bool) {
-	block, found = st.blocks[name]
-	for !found && st.parent != nil {
-		st = st.parent
-		block, found = st.blocks[name]
+	return st.getBlockProbed(name, nil)
+}
+
+func (st *scope) getBlockProbed(name string, rt *Runtime) (block *BlockNode, found bool) {
+	candidates := make([]ScopeCandidate, 0, 2)
+	depth := 0
+	cur := st
+	for {
+		_, hit := cur.blocks[name]
+		candidates = append(candidates, ScopeCandidate{Kind: SourceBlock, Depth: depth, Hit: hit, BlockCount: len(cur.blocks)})
+		if hit {
+			block, found = cur.blocks[name], true
+			break
+		}
+		if cur.parent == nil {
+			break
+		}
+		cur = cur.parent
+		depth++
+	}
+	if rt != nil && rt.probe != nil {
+		ev := LookupEvent{
+			Kind:       LookupBlock,
+			Name:       name,
+			Candidates: candidates,
+			Found:      found,
+		}
+		if found && block != nil {
+			ev.Source = SourceBlock
+			ev.Template = block.TemplatePath
+		}
+		rt.emit(ev)
 	}
 	return
 }
 
 func (state *Runtime) setValue(name string, val reflect.Value) error {
+	candidates := make([]ScopeCandidate, 0, 2)
 	// try changing existing variable in current or parent scope
 	sc := state.scope
+	depth := 0
 	for sc != nil {
-		if _, ok := sc.variables[name]; ok {
+		_, hit := sc.variables[name]
+		kind := SourceLocal
+		if sc == state.rootScope {
+			kind = SourceTemplate
+		}
+		candidates = append(candidates, ScopeCandidate{Kind: kind, Depth: depth, Hit: hit})
+		if hit {
 			sc.variables[name] = val
+			if state.probe != nil {
+				state.emit(LookupEvent{
+					Kind:       LookupVariable,
+					Op:         "assign",
+					Name:       name,
+					Candidates: candidates,
+					Source:     kind,
+					Found:      true,
+				})
+			}
 			return nil
 		}
 		sc = sc.parent
+		depth++
+	}
+
+	if state.probe != nil {
+		state.emit(LookupEvent{
+			Kind:       LookupVariable,
+			Op:         "assign",
+			Name:       name,
+			Candidates: candidates,
+			Found:      false,
+		})
 	}
 
 	return fmt.Errorf("could not assign %q = %v because variable %q is uninitialised", name, val, name)
@@ -159,6 +218,20 @@ func (state *Runtime) LetGlobal(name string, val interface{}) {
 	}
 
 	sc.variables[name] = reflect.ValueOf(val)
+	if state.probe != nil {
+		kind := SourceLocal
+		if sc == state.rootScope {
+			kind = SourceTemplate
+		}
+		state.emit(LookupEvent{
+			Kind:       LookupVariable,
+			Op:         "let",
+			Name:       name,
+			Candidates: []ScopeCandidate{{Kind: kind, Depth: 0, Hit: true}},
+			Source:     kind,
+			Found:      true,
+		})
+	}
 }
 
 // Set sets an existing variable in the template scope it lives in.
@@ -169,6 +242,51 @@ func (state *Runtime) Set(name string, val interface{}) error {
 // Let initialises a variable in the current template scope (possibly shadowing an existing variable of the same name in a parent scope).
 func (state *Runtime) Let(name string, val interface{}) {
 	state.scope.variables[name] = reflect.ValueOf(val)
+	if state.probe != nil {
+		state.emitLetEvent(name)
+	}
+}
+
+func (state *Runtime) emitLetEvent(name string) {
+	if state.probe == nil {
+		return
+	}
+	kind := SourceLocal
+	if state.scope == state.rootScope {
+		kind = SourceTemplate
+	}
+	shadowed := ""
+	for sc := state.scope.parent; sc != nil; sc = sc.parent {
+		if _, ok := sc.variables[name]; ok {
+			if sc == state.rootScope {
+				shadowed = SourceTemplate
+			} else {
+				shadowed = SourceLocal
+			}
+			break
+		}
+	}
+	if shadowed == "" {
+		if state.set != nil {
+			state.set.gmx.RLock()
+			_, g := state.set.globals[name]
+			state.set.gmx.RUnlock()
+			if g {
+				shadowed = SourceGlobal
+			} else if _, d := defaultVariables[name]; d {
+				shadowed = SourceDefault
+			}
+		}
+	}
+	state.emit(LookupEvent{
+		Kind:       LookupVariable,
+		Op:         "let",
+		Name:       name,
+		Candidates: []ScopeCandidate{{Kind: kind, Depth: 0, Hit: true}},
+		Source:     kind,
+		Template:   shadowed,
+		Found:      true,
+	})
 }
 
 // SetOrLet calls Set() (if a variable with the given name is visible from the current scope) or Let() (if there is no variable with the given name in the current or any parent scope).
@@ -184,7 +302,33 @@ func (state *Runtime) SetOrLet(name string, val interface{}) {
 // Resolve resolves a value from the execution context.
 func (state *Runtime) resolve(name string) (reflect.Value, error) {
 	if name == "." {
+		if state.probe != nil {
+			state.emit(LookupEvent{
+				Kind:       LookupVariable,
+				Op:         "read",
+				Name:       ".",
+				Candidates: []ScopeCandidate{{Kind: "context", Depth: 0, Hit: state.context.IsValid()}},
+				Source:     "context",
+				Found:      state.context.IsValid(),
+			})
+		}
 		return state.context, nil
+	}
+
+	if state.probe != nil {
+		candidates, source, v := state.variableCandidates(name)
+		state.emit(LookupEvent{
+			Kind:       LookupVariable,
+			Op:         "read",
+			Name:       name,
+			Candidates: candidates,
+			Source:     source,
+			Found:      source != "",
+		})
+		if source != "" {
+			return indirectEface(v), nil
+		}
+		return reflect.Value{}, fmt.Errorf("identifier %q not available in current (%+v) or parent scope, global, or default variables", name, state.scope.variables)
 	}
 
 	// try current, then parent variable scopes
@@ -330,7 +474,11 @@ func (st *Runtime) executeLetList(set *SetNode) {
 		for i := 0; i < len(set.Left); i++ {
 			value := st.evalPrimaryExpressionGroup(set.Right[i])
 			if set.Left[i].Type() != NodeUnderscore {
-				st.variables[set.Left[i].(*IdentifierNode).Ident] = value
+				ident := set.Left[i].(*IdentifierNode).Ident
+				st.variables[ident] = value
+				if st.probe != nil {
+					st.emitLetEvent(ident)
+				}
 			}
 		}
 	}
@@ -543,7 +691,7 @@ func (st *Runtime) executeList(list *ListNode) (returnValue reflect.Value) {
 					st.content(st, node.Expression)
 				}
 			} else {
-				block, found := st.getBlock(node.Name)
+				block, found := st.getBlockProbed(node.Name, st)
 				if !found || block == nil {
 					node.errorf("unresolved block %q!", node.Name)
 				}
@@ -551,9 +699,19 @@ func (st *Runtime) executeList(list *ListNode) (returnValue reflect.Value) {
 			}
 		case NodeBlock:
 			node := node.(*BlockNode)
-			block, found := st.getBlock(node.Name)
+			block, found := st.getBlockProbed(node.Name, st)
 			if !found {
 				block = node
+				if st.probe != nil {
+					st.emit(LookupEvent{
+						Kind:       LookupBlock,
+						Name:       node.Name,
+						Candidates: []ScopeCandidate{{Kind: SourceBlock, Depth: 0, Hit: false, BlockCount: len(st.blocks)}},
+						Source:     SourceBlock,
+						Template:   node.TemplatePath,
+						Found:      true,
+					})
+				}
 			}
 			st.executeYieldBlock(block, block.Parameters, block.Parameters, block.Expression, block.Content)
 		case NodeInclude:
@@ -601,12 +759,22 @@ func (st *Runtime) executeTry(try *TryNode) (returnValue reflect.Value) {
 	return st.executeList(try.List)
 }
 
-func (st *Runtime) executeInclude(node *IncludeNode) (returnValue reflect.Value) {
-	if st.includeDepth >= 100_000 {
+// maximumIncludeDepth bounds include nesting so that cyclic includes cannot grow the
+// goroutine stack without limit.
+const maximumIncludeDepth = 100_000
+
+// enterInclude enforces the include nesting bound and reports the stable error text
+// used at the guard. It is split out so the bound can be exercised cheaply.
+func (st *Runtime) enterInclude(node *IncludeNode) (leave func()) {
+	if st.includeDepth >= maximumIncludeDepth {
 		node.errorf("maximum 'include' depth (100000) exceeded")
 	}
 	st.includeDepth++
-	defer func() { st.includeDepth-- }()
+	return func() { st.includeDepth-- }
+}
+
+func (st *Runtime) executeInclude(node *IncludeNode) (returnValue reflect.Value) {
+	defer st.enterInclude(node)()
 
 	var templatePath string
 	name := st.evalPrimaryExpressionGroup(node.Name)
@@ -621,7 +789,7 @@ func (st *Runtime) executeInclude(node *IncludeNode) (returnValue reflect.Value)
 		node.errorf("evaluating name of template to include: unexpected expression type %q", getTypeString(name))
 	}
 
-	t, err := st.set.getSiblingTemplate(templatePath, node.TemplatePath, true)
+	t, _, err := st.set.getSiblingTemplateTraced(templatePath, node.TemplatePath, true, st.probeStack())
 	if err != nil {
 		node.error(err)
 		return reflect.Value{}
@@ -639,13 +807,18 @@ func (st *Runtime) executeInclude(node *IncludeNode) (returnValue reflect.Value)
 		st.context = st.evalPrimaryExpressionGroup(node.Context)
 	}
 
+	executed := t
 	Root := t.Root
 	for t.extends != nil {
 		t = t.extends
 		Root = t.Root
 	}
+	executed = t
 
-	return st.executeList(Root)
+	st.pushTemplateFrame(executed.Name)
+	rv := st.executeList(Root)
+	st.popTemplateFrame()
+	return rv
 }
 
 var (

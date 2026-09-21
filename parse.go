@@ -264,12 +264,12 @@ func (t *Template) parseTemplate(cacheAfterParsing bool) (next Node) {
 						t.errorf("Unexpected extends clause: the 'extends' clause should come before all import clauses")
 					}
 					var err error
-					t.extends, err = t.set.getSiblingTemplate(s, t.Name, cacheAfterParsing)
+					t.extends, _, err = t.set.getSiblingTemplateTraced(s, t.Name, cacheAfterParsing, []string{t.Name})
 					if err != nil {
 						t.error(err)
 					}
 				} else {
-					tt, err := t.set.getSiblingTemplate(s, t.Name, cacheAfterParsing)
+					tt, _, err := t.set.getSiblingTemplateTraced(s, t.Name, cacheAfterParsing, []string{t.Name})
 					if err != nil {
 						t.error(err)
 					}

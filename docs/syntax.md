@@ -471,6 +471,10 @@ You can also have the error that occured assigned to a variable inside the `catc
 
 ## Templates
 
+> See [Name Resolution](./name-resolution.md) for the exact parse-time vs
+> execution-time binding rules, precedence and complexity of `include`,
+> `extends`, `import`, `block` and `yield`.
+
 ### include
 
 Including a template is similar to using partials in other template languages. All local and global variables are available to you in the included template. You can pass a context by specifying it as the last argument in the `include` statement. If you don't pass a context, the current context will be kept.

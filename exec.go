@@ -60,6 +60,10 @@ func (t *Template) Execute(w io.Writer, variables VarMap, data interface{}) (err
 	st.variables = variables
 	st.set = t.set
 	st.Writer = w
+	st.rootScope = st.scope
+	if p := lookupProbeFor(t.set); p != nil {
+		st.probe = &probe{target: p, count: 0}
+	}
 
 	// resolve extended template
 	for t.extends != nil {
@@ -70,6 +74,8 @@ func (t *Template) Execute(w io.Writer, variables VarMap, data interface{}) (err
 		st.context = reflect.ValueOf(data)
 	}
 
+	st.pushTemplateFrame(t.Name)
 	st.executeList(t.Root)
+	st.popTemplateFrame()
 	return
 }
