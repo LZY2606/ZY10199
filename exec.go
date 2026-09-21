@@ -20,6 +20,7 @@ package jet
 
 import (
 	"io"
+	"path/filepath"
 	"reflect"
 	"sort"
 )
@@ -53,6 +54,13 @@ func (scope VarMap) SetWriter(name string, v SafeWriter) VarMap {
 
 // Execute executes the template into w.
 func (t *Template) Execute(w io.Writer, variables VarMap, data interface{}) (err error) {
+	return t.execute(w, variables, data, nil)
+}
+
+// execute is the internal entry point used by tests and instrumentation. When
+// observer is nil it is identical to Execute; allocations and error text are
+// unchanged.
+func (t *Template) execute(w io.Writer, variables VarMap, data interface{}, observer lookupObserver) (err error) {
 	st := pool_State.Get().(*Runtime)
 	defer st.recover(&err)
 
@@ -60,6 +68,14 @@ func (t *Template) Execute(w io.Writer, variables VarMap, data interface{}) (err
 	st.variables = variables
 	st.set = t.set
 	st.Writer = w
+	st.observer = observer
+
+	if observer != nil {
+		if r, ok := observer.(*LookupRecorder); ok {
+			r.pushFrame("execute", filepath.ToSlash(t.Name))
+			defer r.popFrame()
+		}
+	}
 
 	// resolve extended template
 	for t.extends != nil {

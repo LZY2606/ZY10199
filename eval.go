@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
@@ -78,6 +79,10 @@ type Runtime struct {
 	includeDepth int
 
 	context reflect.Value
+
+	// observer is nil in normal execution; when set it records name-resolution
+	// decisions without participating in them.
+	observer lookupObserver
 }
 
 // Context returns the current context value
@@ -110,7 +115,7 @@ func (s scope) sortedBlocks() []string {
 
 // YieldBlock yields a block in the current context, will panic if the context is not available
 func (st *Runtime) YieldBlock(name string, context interface{}) {
-	block, found := st.getBlock(name)
+	block, found := st.resolveBlock(name)
 
 	if !found {
 		panic(fmt.Errorf("Block %q was not found!!", name))
@@ -133,6 +138,76 @@ func (st *scope) getBlock(name string) (block *BlockNode, found bool) {
 		block, found = st.blocks[name]
 	}
 	return
+}
+
+// lookupBlock is the observed form of getBlock. The decision logic is the same
+// walk as (*scope).getBlock; it additionally records every block table probed.
+// Block tables are maps, so nothing here (or in the tests) assumes an iteration
+// order: only the named slot of each table is read.
+func (state *Runtime) lookupBlock(name string) (block *BlockNode, found bool) {
+	sc := state.scope
+	startDepth := state.scopeDepth()
+	ev := lookupEvent{
+		Kind:          lookupBlock,
+		Name:          name,
+		StartAt:       startDepth,
+		Selected:      sourceUnresolved,
+		SelectedDepth: -1,
+		liveStack:     state.liveStack(),
+	}
+	depth := startDepth
+	for sc != nil {
+		block, found = sc.blocks[name]
+		ev.Candidates = append(ev.Candidates, lookupCandidate{
+			Layer:   fmt.Sprintf("blocks:%d", depth),
+			Present: found,
+		})
+		if found {
+			ev.Selected = sourceBlockTable
+			ev.SelectedDepth = depth
+			ev.SelectedTemplate = filepath.ToSlash(block.TemplatePath)
+			break
+		}
+		sc = sc.parent
+		depth--
+	}
+	ev.Found = found
+	state.observer.blockEvent(ev)
+	return
+}
+
+// resolveBlock selects the observed or unobserved block walk. With no observer
+// attached this is exactly the original (*scope).getBlock path.
+func (state *Runtime) resolveBlock(name string) (*BlockNode, bool) {
+	if state.observer == nil {
+		return state.scope.getBlock(name)
+	}
+	return state.lookupBlock(name)
+}
+
+// scopeDepth returns the distance of the current scope from the execute scope
+// (the bottom of the chain, seeded from Template.Execute's variables), which is
+// depth 0.
+func (state *Runtime) scopeDepth() int {
+	depth := 0
+	sc := state.scope
+	for sc != nil && sc.parent != nil {
+		sc = sc.parent
+		depth++
+	}
+	return depth
+}
+
+// liveStack forwards a pointer to the recorder's live template-call stack when
+// one is attached. The recorder copies it only if it retains the event.
+func (state *Runtime) liveStack() *[]templateFrame {
+	if state.observer == nil {
+		return nil
+	}
+	if r, ok := state.observer.(*LookupRecorder); ok {
+		return &r.stack
+	}
+	return nil
 }
 
 func (state *Runtime) setValue(name string, val reflect.Value) error {
@@ -184,7 +259,23 @@ func (state *Runtime) SetOrLet(name string, val interface{}) {
 // Resolve resolves a value from the execution context.
 func (state *Runtime) resolve(name string) (reflect.Value, error) {
 	if name == "." {
+		if state.observer != nil {
+			state.observer.variableEvent(lookupEvent{
+				Kind:          lookupVariable,
+				Name:          ".",
+				StartAt:       state.scopeDepth(),
+				Candidates:    []lookupCandidate{{Layer: "context", Present: state.context.IsValid()}},
+				Selected:      sourceContext,
+				SelectedDepth: -1,
+				Found:         state.context.IsValid(),
+				liveStack:     state.liveStack(),
+			})
+		}
 		return state.context, nil
+	}
+
+	if state.observer != nil {
+		return state.resolveObserved(name)
 	}
 
 	// try current, then parent variable scopes
@@ -214,6 +305,78 @@ func (state *Runtime) resolve(name string) (reflect.Value, error) {
 	return reflect.Value{}, fmt.Errorf("identifier %q not available in current (%+v) or parent scope, global, or default variables", name, state.scope.variables)
 }
 
+// resolveObserved performs the identical lookup as resolve() while recording
+// every probed layer, its presence, and the decisive source. It must stay in
+// lock-step with resolve(): same probe order, same indirectEface handling and
+// the same terminal error text.
+func (state *Runtime) resolveObserved(name string) (reflect.Value, error) {
+	ev := lookupEvent{
+		Kind:          lookupVariable,
+		Name:          name,
+		StartAt:       state.scopeDepth(),
+		Selected:      sourceUnresolved,
+		SelectedDepth: -1,
+		liveStack:     state.liveStack(),
+	}
+
+	// lexical variable scopes, innermost first; the execute scope sits at depth 0
+	sc := state.scope
+	depth := ev.StartAt
+	for sc != nil {
+		v, ok := sc.variables[name]
+		ev.Candidates = append(ev.Candidates, lookupCandidate{
+			Layer:   fmt.Sprintf("scope:%d", depth),
+			Present: ok,
+		})
+		if ok {
+			ev.Selected = scopeDepthSource(depth)
+			ev.SelectedDepth = depth
+			ev.Found = true
+			state.observer.variableEvent(ev)
+			return indirectEface(v), nil
+		}
+		sc = sc.parent
+		depth--
+	}
+
+	// globals registered on the Set
+	state.set.gmx.RLock()
+	v, ok := state.set.globals[name]
+	state.set.gmx.RUnlock()
+	ev.Candidates = append(ev.Candidates, lookupCandidate{Layer: string(sourceGlobal), Present: ok})
+	if ok {
+		ev.Selected = sourceGlobal
+		ev.Found = true
+		state.observer.variableEvent(ev)
+		return indirectEface(v), nil
+	}
+
+	// built-in default variables/functions
+	v, ok = defaultVariables[name]
+	ev.Candidates = append(ev.Candidates, lookupCandidate{Layer: string(sourceDefault), Present: ok})
+	if ok {
+		ev.Selected = sourceDefault
+		ev.Found = true
+		state.observer.variableEvent(ev)
+		return indirectEface(v), nil
+	}
+
+	state.observer.variableEvent(ev)
+	return reflect.Value{}, fmt.Errorf("identifier %q not available in current (%+v) or parent scope, global, or default variables", name, state.scope.variables)
+}
+
+// scopeDepthSource labels the execute scope (depth 0) distinctly from the
+// intermediate scopes created for blocks, ranges and includes.
+func scopeDepthSource(depth int) lookupSource {
+	if depth == 0 {
+		return sourceExecuteScope
+	}
+	if depth == 1 {
+		return sourceLocalScope
+	}
+	return sourceParentScope
+}
+
 // Resolve calls resolve() and ignores any errors, meaning it may return a zero reflect.Value.
 func (state *Runtime) Resolve(name string) reflect.Value {
 	v, _ := state.resolve(name)
@@ -233,6 +396,7 @@ func (st *Runtime) recover(err *error) {
 	// reset state scope and context just to be safe (they might not be cleared properly if there was a panic while using the state)
 	st.scope = &scope{}
 	st.context = reflect.Value{}
+	st.observer = nil
 	pool_State.Put(st)
 	if recovered := recover(); recovered != nil {
 		var ok bool
@@ -543,7 +707,7 @@ func (st *Runtime) executeList(list *ListNode) (returnValue reflect.Value) {
 					st.content(st, node.Expression)
 				}
 			} else {
-				block, found := st.getBlock(node.Name)
+				block, found := st.resolveBlock(node.Name)
 				if !found || block == nil {
 					node.errorf("unresolved block %q!", node.Name)
 				}
@@ -551,7 +715,7 @@ func (st *Runtime) executeList(list *ListNode) (returnValue reflect.Value) {
 			}
 		case NodeBlock:
 			node := node.(*BlockNode)
-			block, found := st.getBlock(node.Name)
+			block, found := st.resolveBlock(node.Name)
 			if !found {
 				block = node
 			}
@@ -645,7 +809,24 @@ func (st *Runtime) executeInclude(node *IncludeNode) (returnValue reflect.Value)
 		Root = t.Root
 	}
 
+	st.pushFrame("include", filepath.ToSlash(t.Name))
+	defer st.popFrame()
+
 	return st.executeList(Root)
+}
+
+// pushFrame/popFrame update the logical template call stack on an attached
+// recorder. They are no-ops without a recorder and never affect rendering.
+func (st *Runtime) pushFrame(kind, template string) {
+	if r, ok := st.observer.(*LookupRecorder); ok {
+		r.pushFrame(kind, template)
+	}
+}
+
+func (st *Runtime) popFrame() {
+	if r, ok := st.observer.(*LookupRecorder); ok {
+		r.popFrame()
+	}
 }
 
 var (

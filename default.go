@@ -22,6 +22,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net/url"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"text/template"
@@ -106,6 +107,8 @@ func init() {
 				a.runtime.context = a.Get(1)
 			}
 
+			a.runtime.pushFrame("includeIfExists", filepath.ToSlash(t.Name))
+			defer a.runtime.popFrame()
 			a.runtime.executeList(root)
 
 			return hiddenTrue
@@ -135,6 +138,8 @@ func init() {
 				defer func() { a.runtime.context = c }()
 				a.runtime.context = a.Get(1)
 			}
+			a.runtime.pushFrame("exec", filepath.ToSlash(t.Name))
+			defer a.runtime.popFrame()
 			result = a.runtime.executeList(root)
 
 			return result

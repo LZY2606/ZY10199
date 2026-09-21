@@ -17,6 +17,7 @@ package jet
 import (
 	"bytes"
 	"fmt"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -222,16 +223,43 @@ func (s *Set) parse(name, text string, cacheAfterParsing bool) (t *Template, err
 	t.stopParse()
 
 	if t.extends != nil {
-		t.addBlocks(t.extends.processedBlocks)
+		t.bindBlocks(t.extends.processedBlocks, "extends")
 	}
 
 	for _, _import := range t.imports {
-		t.addBlocks(_import.processedBlocks)
+		t.bindBlocks(_import.processedBlocks, "import")
 	}
 
-	t.addBlocks(t.passedBlocks)
+	t.bindBlocks(t.passedBlocks, "self")
 
 	return t, err
+}
+
+// bindBlocks merges src into t.processedBlocks exactly as addBlocks did (later
+// writes win), and, when a parse observer is attached, emits one parseBindEvent
+// per block reporting whether the binding shadowed an existing one. This is the
+// parse-time side of the name-resolution graph.
+func (t *Template) bindBlocks(src map[string]*BlockNode, phase string) {
+	if len(src) == 0 {
+		return
+	}
+	if t.processedBlocks == nil {
+		t.processedBlocks = make(map[string]*BlockNode)
+	}
+	obs := t.set.parseObserver
+	for key, value := range src {
+		_, existed := t.processedBlocks[key]
+		t.processedBlocks[key] = value
+		if obs != nil {
+			obs.parseEvent(parseBindEvent{
+				Template: filepath.ToSlash(t.Name),
+				Name:     key,
+				Origin:   filepath.ToSlash(value.TemplatePath),
+				Phase:    phase,
+				Shadowed: existed,
+			})
+		}
+	}
 }
 
 func (t *Template) expectString(context string) string {

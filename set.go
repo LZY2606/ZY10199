@@ -23,8 +23,13 @@ type Set struct {
 	developmentMode bool
 	leftDelim       string
 	rightDelim      string
-	leftComment       string
-	rightComment     string
+	leftComment     string
+	rightComment    string
+
+	// parseObserver, when set, receives parse-time block binding decisions made by
+	// (*Set).parse via (*Template).bindBlock. It is test-only instrumentation and
+	// never changes parsing output.
+	parseObserver lookupObserver
 }
 
 // Option is the type of option functions that can be used in NewSet().
